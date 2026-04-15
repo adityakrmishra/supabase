@@ -174,6 +174,43 @@ async function debuggableNavigatorLock<R>(
         bc.close()
       }
     })
+  } catch (e: any) {
+    // Circuit breaker for the steal-cascade deadlock (Issue #44642).
+    //
+    // When a Chrome tab is suspended, navigator.locks can become orphaned —
+    // the lock is held at the browser level but the JS holding it is frozen.
+    // auth-js recovers by using { steal: true }, but per the Web Locks spec
+    // the original holder's fn() continues running as an orphaned task. When
+    // it resumes and calls navigatorLock() again, auth-js detects that OUR
+    // lock was stolen and throws NavigatorLockAcquireTimeoutError with the
+    // "stole it" message. If we re-throw here, the caller gets an unhandled
+    // error and any pending auth operations never complete — the app freezes.
+    //
+    // Fix: run fn() directly, without the lock. This is safe because at this
+    // point we are already running as an orphaned background task (the lock
+    // we held was stolen). Completing fn() harmlessly and exiting breaks the
+    // infinite queue — the stealer already holds the lock and will complete
+    // its own fn(), so the two runs are racing (bad), but no worse than the
+    // status quo from auth-js's own steal recovery which also runs fn() twice.
+    // Crucially, it prevents the infinite steal-back loop that freezes the UI.
+    if (
+      e?.name === 'NavigatorLockAcquireTimeoutError' ||
+      (typeof e?.message === 'string' && e.message.includes('stole it'))
+    ) {
+      console.warn(
+        '[Supabase Auth] Circuit breaker tripped: Lock cascade detected. ' +
+          'Bypassing lock to unfreeze app. ' +
+          `Lock name: "${name}". Original error: ${e?.message}`
+      )
+
+      if (captureException) {
+        captureException(e)
+      }
+
+      return await fn()
+    }
+
+    throw e
   } finally {
     clearTimeout(debugTimeout)
   }
